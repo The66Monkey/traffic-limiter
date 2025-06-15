@@ -29,14 +29,6 @@ or from your desktop application menu (if a desktop file was installed).
 
     Clear Limits: Click the "Clear Limit" button to remove any active limits.
 
-#### From Source
-
-1. **Clone the Repository:**
-
-
-   git clone https://github.com/yourusername/traffic-limiter.git
-   cd traffic-limiter
-
-##### From Source
+#### LICENSE
 
 Traffic Limiter is licensed under the GNU General Public License v3 (GPLv3). See the LICENSE file for the full license text.
