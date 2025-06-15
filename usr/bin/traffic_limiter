@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+
+#
+# This file is part of Traffic Limiter.
+#
+# Traffic Limiter is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Traffic Limiter is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Traffic Limiter. If not, see <https://www.gnu.org/licenses/>.
+#
+
+import gi
+import shlex
+import subprocess
+import sys
+
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gtk, Gio
+
+def run_command(cmd_list):
+    """Wrapper to run a command via subprocess and print errors if any."""
+    try:
+        result = subprocess.run(cmd_list, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"Error running {' '.join(cmd_list)}:\n{result.stderr.strip()}", file=sys.stderr)
+        return result
+    except Exception as e:
+        print(f"Exception running {' '.join(cmd_list)}: {e}", file=sys.stderr)
+        return None
+
+def ensure_ifb0():
+    """
+    Ensure that the ifb0 virtual interface exists and is up.
+    If not, create it using sudo.
+    """
+    result = subprocess.run(["ip", "link", "show", "ifb0"], capture_output=True, text=True)
+    if "ifb0" in result.stdout:
+        print("ifb0 already exists.")
+    else:
+        print("ifb0 not found. Creating ifb0...")
+        run_command(["sudo", "ip", "link", "add", "ifb0", "type", "ifb"])
+        run_command(["sudo", "ip", "link", "set", "ifb0", "up"])
+
+def clear_qdisc(interface):
+    """
+    Checks if a non-default qdisc exists on the given interface and deletes it.
+    This avoids error messages when there is nothing to delete.
+    """
+    result = run_command(["sudo", "tc", "qdisc", "show", "dev", interface])
+    if result and (("tbf" in result.stdout) or ("ingress" in result.stdout)):
+        run_command(["sudo", "tc", "qdisc", "del", "dev", interface, "root"])
+        run_command(["sudo", "tc", "qdisc", "del", "dev", interface, "ingress"])
+    else:
+        print(f"No non-default qdisc to clear on {interface}.")
+
+class TrafficLimiter(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="TC Bandwidth Limiter")
+        self.set_default_size(600, 400)
+
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.set_child(main_box)
+
+        # Interface label and TreeView
+        self.info_label = Gtk.Label(label="Available Network Interfaces (Name & IP):")
+        main_box.append(self.info_label)
+
+        self.store = Gtk.ListStore(str, str)
+        self.interface_view = Gtk.TreeView(model=self.store)
+        for i, title in enumerate(["Interface", "IP Address"]):
+            renderer = Gtk.CellRendererText()
+            column = Gtk.TreeViewColumn(title, renderer, text=i)
+            self.interface_view.append_column(column)
+
+        scrolled_win = Gtk.ScrolledWindow()
+        scrolled_win.set_child(self.interface_view)
+        scrolled_win.set_vexpand(True)
+        main_box.append(scrolled_win)
+
+        refresh_button = Gtk.Button(label="Refresh Interfaces")
+        refresh_button.connect("clicked", self.populate_interfaces)
+        main_box.append(refresh_button)
+
+        # Speed input section
+        self.upload_label = Gtk.Label(label="Set Upload Speed (in kbps):")
+        main_box.append(self.upload_label)
+        self.upload_entry = Gtk.Entry(placeholder_text="e.g., 500")
+        main_box.append(self.upload_entry)
+
+        self.download_label = Gtk.Label(label="Set Download Speed (in kbps):")
+        main_box.append(self.download_label)
+        self.download_entry = Gtk.Entry(placeholder_text="e.g., 500")
+        main_box.append(self.download_entry)
+
+        # Buttons for applying and clearing limits
+        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        main_box.append(hbox)
+
+        apply_button = Gtk.Button(label="Apply Limit")
+        apply_button.connect("clicked", self.apply_limit)
+        hbox.append(apply_button)
+
+        clear_button = Gtk.Button(label="Clear Limit")
+        clear_button.connect("clicked", self.clear_limit)
+        hbox.append(clear_button)
+
+        self.populate_interfaces()
+
+    def populate_interfaces(self, widget=None):
+        """Populate the TreeView with interface names and IPv4 addresses."""
+        self.store.clear()
+
+        result = subprocess.run(["ls", "/sys/class/net"], capture_output=True, text=True)
+        interfaces = result.stdout.strip().splitlines()
+
+        ip_result = subprocess.run(["ip", "-o", "-4", "addr", "show"], capture_output=True, text=True)
+        lines = ip_result.stdout.strip().splitlines()
+        ip_map = {}
+        for line in lines:
+            parts = line.split()
+            if len(parts) >= 4:
+                intf = parts[1]
+                ipaddr = parts[3].split("/")[0]
+                ip_map[intf] = ipaddr
+
+        for iface in interfaces:
+            ipaddr = ip_map.get(iface, "No IP Assigned")
+            self.store.append([iface, ipaddr])
+
+    def get_selected_interface(self):
+        """Return the name of the selected interface in the TreeView."""
+        selection = self.interface_view.get_selection()
+        model, tree_iter = selection.get_selected()
+        if tree_iter is None:
+            print("No interface selected.")
+            return None
+        selected = model[tree_iter][0].strip()
+        print(f"Selected Interface: '{selected}'")
+        return selected
+
+    def apply_limit(self, widget):
+        interface = self.get_selected_interface()
+        upload_speed = self.upload_entry.get_text().strip()
+        download_speed = self.download_entry.get_text().strip()
+
+        if not interface:
+            print("No interface selected. Aborting Apply Limit.")
+            return
+        if not upload_speed.isdigit() or not download_speed.isdigit():
+            print("Error: Upload and Download speeds must be numeric values.")
+            return
+
+        print(f"Attempting to apply limits on {interface}: {upload_speed} kbps upl, {download_speed} kbps dnl.")
+
+        # Ensure ifb0 exists before proceeding
+        ensure_ifb0()
+
+        # Clear any prior rules (ignore errors if none exist)
+        clear_qdisc(interface)
+        clear_qdisc("ifb0")
+
+        # Apply upload limit (egress) on the selected interface
+        upl_cmd = ["sudo", "tc", "qdisc", "add", "dev", interface, "root",
+                   "tbf", "rate", f"{upload_speed}kbit", "burst", "16kbit", "latency", "50ms"]
+        run_command(upl_cmd)
+
+        # Configure ingress redirection to ifb0, then apply download rate limit there.
+        ing_cmd = ["sudo", "tc", "qdisc", "add", "dev", interface, "ingress"]
+        run_command(ing_cmd)
+        filt_cmd = ["sudo", "tc", "filter", "add", "dev", interface, "parent", "ffff:",
+                    "protocol", "ip", "u32", "match", "ip", "dst", "0.0.0.0/0",
+                    "flowid", "1:1", "action", "mirred", "egress", "redirect", "dev", "ifb0"]
+        run_command(filt_cmd)
+        dnl_cmd = ["sudo", "tc", "qdisc", "add", "dev", "ifb0", "root",
+                   "tbf", "rate", f"{download_speed}kbit", "burst", "16kbit", "latency", "50ms"]
+        run_command(dnl_cmd)
+
+        print("Limits applied.")
+
+    def clear_limit(self, widget):
+        interface = self.get_selected_interface()
+        if not interface:
+            print("No interface selected. Cannot clear limits.")
+            return
+
+        print(f"Clearing limits on {interface} and ifb0.")
+        clear_qdisc(interface)
+        clear_qdisc("ifb0")
+        print("Limits cleared.")
+
+class TrafficApp(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="com.example.TrafficLimiter", flags=Gio.ApplicationFlags.FLAGS_NONE)
+
+    def do_activate(self):
+        window = TrafficLimiter(self)
+        window.present()
+
+if __name__ == "__main__":
+    app = TrafficApp()
+    app.run([])
+
