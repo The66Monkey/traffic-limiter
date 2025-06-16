@@ -17,13 +17,13 @@
 # along with Traffic Limiter. If not, see <https://www.gnu.org/licenses/>.
 #
 
+#!/usr/bin/env python3
 import gi
-import shlex
 import subprocess
 import sys
 
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gtk, Gio
+from gi.repository import Gtk, Gio, GLib
 
 def run_command(cmd_list):
     """Wrapper to run a command via subprocess and print errors if any."""
@@ -36,35 +36,15 @@ def run_command(cmd_list):
         print(f"Exception running {' '.join(cmd_list)}: {e}", file=sys.stderr)
         return None
 
-def ensure_ifb0():
-    """
-    Ensure that the ifb0 virtual interface exists and is up.
-    If not, create it using sudo.
-    """
-    result = subprocess.run(["ip", "link", "show", "ifb0"], capture_output=True, text=True)
-    if "ifb0" in result.stdout:
-        print("ifb0 already exists.")
-    else:
-        print("ifb0 not found. Creating ifb0...")
-        run_command(["sudo", "ip", "link", "add", "ifb0", "type", "ifb"])
-        run_command(["sudo", "ip", "link", "set", "ifb0", "up"])
-
-def clear_qdisc(interface):
-    """
-    Checks if a non-default qdisc exists on the given interface and deletes it.
-    This avoids error messages when there is nothing to delete.
-    """
-    result = run_command(["sudo", "tc", "qdisc", "show", "dev", interface])
-    if result and (("tbf" in result.stdout) or ("ingress" in result.stdout)):
-        run_command(["sudo", "tc", "qdisc", "del", "dev", interface, "root"])
-        run_command(["sudo", "tc", "qdisc", "del", "dev", interface, "ingress"])
-    else:
-        print(f"No non-default qdisc to clear on {interface}.")
+def get_tc_status(interface):
+    """Fetch and return the active traffic limiter details."""
+    result = subprocess.run(["sudo", "tc", "qdisc", "show", "dev", interface], capture_output=True, text=True)
+    return result.stdout.strip()
 
 class TrafficLimiter(Gtk.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="TC Bandwidth Limiter")
-        self.set_default_size(600, 400)
+        self.set_default_size(600, 450)
 
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         self.set_child(main_box)
@@ -100,6 +80,10 @@ class TrafficLimiter(Gtk.ApplicationWindow):
         self.download_entry = Gtk.Entry(placeholder_text="e.g., 500")
         main_box.append(self.download_entry)
 
+        # Status Label
+        self.status_label = Gtk.Label(label="Limiter Status: Not Applied")
+        main_box.append(self.status_label)
+
         # Buttons for applying and clearing limits
         hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         main_box.append(hbox)
@@ -114,10 +98,12 @@ class TrafficLimiter(Gtk.ApplicationWindow):
 
         self.populate_interfaces()
 
+        # Automatically refresh limiter status every 5 seconds
+        GLib.timeout_add_seconds(5, self.update_status)
+
     def populate_interfaces(self, widget=None):
         """Populate the TreeView with interface names and IPv4 addresses."""
         self.store.clear()
-
         result = subprocess.run(["ls", "/sys/class/net"], capture_output=True, text=True)
         interfaces = result.stdout.strip().splitlines()
 
@@ -143,8 +129,18 @@ class TrafficLimiter(Gtk.ApplicationWindow):
             print("No interface selected.")
             return None
         selected = model[tree_iter][0].strip()
-        print(f"Selected Interface: '{selected}'")
         return selected
+
+    def update_status(self):
+        """Update the status window dynamically."""
+        interface = self.get_selected_interface()
+        if interface:
+            status_text = get_tc_status(interface)
+            if status_text:
+                self.status_label.set_text(f"Limiter Status: {status_text}")
+            else:
+                self.status_label.set_text("Limiter Status: Not Applied")
+        return True  # Keeps the timer running
 
     def apply_limit(self, widget):
         interface = self.get_selected_interface()
@@ -158,31 +154,21 @@ class TrafficLimiter(Gtk.ApplicationWindow):
             print("Error: Upload and Download speeds must be numeric values.")
             return
 
-        print(f"Attempting to apply limits on {interface}: {upload_speed} kbps upl, {download_speed} kbps dnl.")
+        print(f"Applying limits on {interface}: {upload_speed} kbps upl, {download_speed} kbps dnl.")
 
-        # Ensure ifb0 exists before proceeding
-        ensure_ifb0()
-
-        # Clear any prior rules (ignore errors if none exist)
-        clear_qdisc(interface)
-        clear_qdisc("ifb0")
-
-        # Apply upload limit (egress) on the selected interface
+        # Apply upload limit (egress)
         upl_cmd = ["sudo", "tc", "qdisc", "add", "dev", interface, "root",
                    "tbf", "rate", f"{upload_speed}kbit", "burst", "16kbit", "latency", "50ms"]
         run_command(upl_cmd)
 
-        # Configure ingress redirection to ifb0, then apply download rate limit there.
+        # Apply download limit (ingress)
         ing_cmd = ["sudo", "tc", "qdisc", "add", "dev", interface, "ingress"]
         run_command(ing_cmd)
-        filt_cmd = ["sudo", "tc", "filter", "add", "dev", interface, "parent", "ffff:",
-                    "protocol", "ip", "u32", "match", "ip", "dst", "0.0.0.0/0",
-                    "flowid", "1:1", "action", "mirred", "egress", "redirect", "dev", "ifb0"]
-        run_command(filt_cmd)
-        dnl_cmd = ["sudo", "tc", "qdisc", "add", "dev", "ifb0", "root",
+        dnl_cmd = ["sudo", "tc", "qdisc", "add", "dev", interface, "root",
                    "tbf", "rate", f"{download_speed}kbit", "burst", "16kbit", "latency", "50ms"]
         run_command(dnl_cmd)
 
+        self.update_status()
         print("Limits applied.")
 
     def clear_limit(self, widget):
@@ -191,9 +177,11 @@ class TrafficLimiter(Gtk.ApplicationWindow):
             print("No interface selected. Cannot clear limits.")
             return
 
-        print(f"Clearing limits on {interface} and ifb0.")
-        clear_qdisc(interface)
-        clear_qdisc("ifb0")
+        print(f"Clearing limits on {interface}.")
+        run_command(["sudo", "tc", "qdisc", "del", "dev", interface, "root"])
+        run_command(["sudo", "tc", "qdisc", "del", "dev", interface, "ingress"])
+
+        self.update_status()
         print("Limits cleared.")
 
 class TrafficApp(Gtk.Application):
@@ -207,4 +195,3 @@ class TrafficApp(Gtk.Application):
 if __name__ == "__main__":
     app = TrafficApp()
     app.run([])
-
