@@ -2,7 +2,7 @@
 Name=Traffic Limiter
 Comment=Set TC bandwidth limits via a GTK interface
 Exec=/usr/bin/traffic_limiter
-Icon=traffic-limiter
+Icon=/usr/share/icons/Traffic-limiter.png
 Terminal=false
 Type=Application
 Categories=Utility;
