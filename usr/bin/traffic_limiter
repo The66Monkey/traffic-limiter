@@ -23,49 +23,88 @@ import sys
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk, Gio, GLib
 
-
-def run_command(cmd_list):
-    """Wrapper to run a command via subprocess and print errors if any."""
+def run_command(cmd_list, ignore_errors_for=None):
+    """
+    Wrapper to run a command via subprocess.
+    If ignore_errors_for is a list containing a substring,
+    any error message containing one of those substrings is suppressed.
+    """
     try:
         result = subprocess.run(cmd_list, capture_output=True, text=True)
         if result.returncode != 0:
-            print(f"Error running {' '.join(cmd_list)}:\n{result.stderr.strip()}",
-                  file=sys.stderr)
+            err = result.stderr.strip()
+            if ignore_errors_for and any(ignore_msg in err for ignore_msg in ignore_errors_for):
+                # Ignore these errors.
+                return result
+            print(f"Error running {' '.join(cmd_list)}:\n{err}", file=sys.stderr)
         return result
     except Exception as e:
         print(f"Exception running {' '.join(cmd_list)}: {e}", file=sys.stderr)
         return None
 
-
-def get_tc_limit(interface):
-    """Fetch only the active limiter rate."""
+def get_tc_limit(interface, unit="MiB/s"):
+    """
+    Fetch the active limit on the egress (on the selected interface)
+    and ingress (via ifb0) and return a string showing the rate
+    in kbit and in the selected unit.
+    """
+    # Get egress limit on the selected interface.
     result = subprocess.run(["sudo", "tc", "qdisc", "show", "dev", interface],
                             capture_output=True, text=True)
-    output_lines = result.stdout.strip().split("\n")
-    for line in output_lines:
-        if "tbf" in line:
+    egress_limit = None
+    for line in result.stdout.strip().split("\n"):
+        if "tbf" in line and "rate" in line:
             parts = line.split()
-            if "rate" in parts:
-                rate_index = parts.index("rate") + 1
-                speed = parts[rate_index]
-                return f"Limiter Active: {speed}"
-    return "No Limit Applied"
+            rate_index = parts.index("rate") + 1
+            # Normalize possible formats (e.g., "81920K" or "81920kbit")
+            speed_str = parts[rate_index].lower().rstrip("kbit").rstrip("k")
+            try:
+                egress_limit = int(speed_str)
+            except ValueError:
+                pass
 
+    # Get ingress limit on IFB device.
+    result_ifb = subprocess.run(["sudo", "tc", "qdisc", "show", "dev", "ifb0"],
+                                capture_output=True, text=True)
+    ingress_limit = None
+    for line in result_ifb.stdout.strip().split("\n"):
+        if "tbf" in line and "rate" in line:
+            parts = line.split()
+            rate_index = parts.index("rate") + 1
+            speed_str = parts[rate_index].lower().rstrip("kbit").rstrip("k")
+            try:
+                ingress_limit = int(speed_str)
+            except ValueError:
+                pass
+
+    def convert(speed_kbit, unit):
+        if unit == "MiB/s":
+            return speed_kbit / 8192
+        elif unit == "KiB/s":
+            return speed_kbit / 8
+        elif unit == "B/s":
+            return speed_kbit * 125  # Convert to Bytes/s
+        return speed_kbit
+
+    # Build the status string appropriately.
+    if egress_limit is not None and ingress_limit is not None:
+        egress_conv = convert(egress_limit, unit)
+        ingress_conv = convert(ingress_limit, unit)
+        return (f"Egress: {egress_limit} kbit ({egress_conv:.2f} {unit}) | "
+                f"Ingress: {ingress_limit} kbit ({ingress_conv:.2f} {unit})")
+    elif egress_limit is not None:
+        egress_conv = convert(egress_limit, unit)
+        return f"Egress: {egress_limit} kbit ({egress_conv:.2f} {unit}) | Ingress: Not Applied"
+    else:
+        return "No Limit Applied"
 
 class TrafficLimiter(Gtk.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="TC Bandwidth Limiter")
         self.set_default_size(600, 450)
 
-        # Define default speed unit.
-        self.selected_unit = "MiB/s"
-
-        # Main vertical container.
+        # Main vertical box to hold sections.
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        main_box.set_margin_top(10)
-        main_box.set_margin_bottom(10)
-        main_box.set_margin_start(10)
-        main_box.set_margin_end(10)
         self.set_child(main_box)
 
         # ----------------------
@@ -94,76 +133,46 @@ class TrafficLimiter(Gtk.ApplicationWindow):
         top_box.append(refresh_button)
 
         # ----------------------
-        # Middle Section: Speed Input & Status
+        # Bottom Section: Speed Control & Status
         # ----------------------
-        middle_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        main_box.append(middle_box)
+        bottom_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        main_box.append(bottom_box)
 
-        self.speed_label = Gtk.Label(label=f"Set Speed (in {self.selected_unit}):")
-        middle_box.append(self.speed_label)
+        self.unit_label = Gtk.Label(label="Select Speed Unit:")
+        bottom_box.append(self.unit_label)
 
-        self.speed_entry = Gtk.Entry(placeholder_text=f"e.g., 10 (in {self.selected_unit})")
-        middle_box.append(self.speed_entry)
+        self.unit_combo = Gtk.ComboBoxText()
+        self.unit_combo.append_text("B/s")
+        self.unit_combo.append_text("KiB/s")
+        self.unit_combo.append_text("MiB/s")
+        self.unit_combo.set_active(2)  # Set default to MiB/s
+        bottom_box.append(self.unit_combo)
+
+        self.speed_label = Gtk.Label(label="Set Speed (for both upload & download):")
+        bottom_box.append(self.speed_label)
+
+        self.speed_entry = Gtk.Entry(placeholder_text="e.g., 10 (in selected unit)")
+        bottom_box.append(self.speed_entry)
 
         self.status_label = Gtk.Label(label="Limiter Status: No Limit Applied")
-        middle_box.append(self.status_label)
+        bottom_box.append(self.status_label)
 
-        # ----------------------
-        # Bottom Section: Action Buttons and Speed Unit Buttons in a Grid
-        # ----------------------
-        bottom_grid = Gtk.Grid()
-        bottom_grid.set_column_spacing(20)
-        bottom_grid.set_row_spacing(10)
-        bottom_grid.set_hexpand(True)
-        main_box.append(bottom_grid)
+        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        bottom_box.append(hbox)
 
-        # Left column: Apply and Clear Buttons.
         apply_button = Gtk.Button(label="Apply Limit")
         apply_button.connect("clicked", self.apply_limit)
-        bottom_grid.attach(apply_button, left=0, top=0, width=1, height=1)
+        hbox.append(apply_button)
 
         clear_button = Gtk.Button(label="Clear Limit")
         clear_button.connect("clicked", self.clear_limit)
-        bottom_grid.attach(clear_button, left=0, top=1, width=1, height=1)
-
-        # Right column: Speed Unit Buttons arranged horizontally.
-        speed_unit_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
-        speed_unit_box.set_hexpand(True)
-        speed_unit_box.set_halign(Gtk.Align.END)
-        bottom_grid.attach(speed_unit_box, left=1, top=0, width=1, height=2)
-
-        self.btn_bs = Gtk.Button(label="B/s")
-        self.btn_bs.connect("clicked", self.on_speed_button_clicked, "B/s")
-        speed_unit_box.append(self.btn_bs)
-
-        self.btn_kib = Gtk.Button(label="KiB/s")
-        self.btn_kib.connect("clicked", self.on_speed_button_clicked, "KiB/s")
-        speed_unit_box.append(self.btn_kib)
-
-        self.btn_mib = Gtk.Button(label="MiB/s")
-        self.btn_mib.connect("clicked", self.on_speed_button_clicked, "MiB/s")
-        speed_unit_box.append(self.btn_mib)
-
-        self.update_speed_buttons()
+        hbox.append(clear_button)
 
         self.populate_interfaces()
         GLib.timeout_add_seconds(5, self.update_status)
 
-    def on_speed_button_clicked(self, widget, unit):
-        """Update the speed unit when a speed button is clicked."""
-        self.selected_unit = unit
-        self.speed_label.set_text(f"Set Speed (in {self.selected_unit}):")
-        self.speed_entry.set_placeholder_text(f"e.g., 10 (in {self.selected_unit})")
-        self.update_speed_buttons()
-
-    def update_speed_buttons(self):
-        """Append an asterisk to the active unit's label for visual feedback."""
-        self.btn_bs.set_label("B/s" + (" *" if self.selected_unit == "B/s" else ""))
-        self.btn_kib.set_label("KiB/s" + (" *" if self.selected_unit == "KiB/s" else ""))
-        self.btn_mib.set_label("MiB/s" + (" *" if self.selected_unit == "MiB/s" else ""))
-
     def populate_interfaces(self, widget=None):
-        """Populate the interface list from the system."""
+        """Populate the TreeView with interface names and IPv4 addresses."""
         self.store.clear()
         result = subprocess.run(["ls", "/sys/class/net"], capture_output=True, text=True)
         interfaces = result.stdout.strip().splitlines()
@@ -177,67 +186,101 @@ class TrafficLimiter(Gtk.ApplicationWindow):
                 intf = parts[1]
                 ipaddr = parts[3].split("/")[0]
                 ip_map[intf] = ipaddr
+
         for iface in interfaces:
             ipaddr = ip_map.get(iface, "No IP Assigned")
             self.store.append([iface, ipaddr])
 
     def get_selected_interface(self):
-        """Return the currently selected network interface."""
+        """Return the name of the selected interface in the TreeView."""
         selection = self.interface_view.get_selection()
         model, tree_iter = selection.get_selected()
         if tree_iter is None:
-            print("No interface selected.")
+            print("No interface selected.", file=sys.stderr)
             return None
         return model[tree_iter][0].strip()
 
     def get_speed_in_kbps(self):
-        """Calculate the speed in kilobits per second based on the selected unit."""
-        speed_str = self.speed_entry.get_text().strip()
-        if not speed_str.isdigit():
-            print("Error: Speed must be a numeric value.")
+        """Convert the provided speed (in the selected unit) to kbit/s."""
+        speed_text = self.speed_entry.get_text().strip()
+        unit = self.unit_combo.get_active_text()
+        if not speed_text.isdigit():
+            print("Error: Speed must be a numeric value.", file=sys.stderr)
             return None
-        speed = int(speed_str)
-        if self.selected_unit == "MiB/s":
+        speed = int(speed_text)
+        if unit == "MiB/s":
             return speed * 8192
-        elif self.selected_unit == "KiB/s":
+        elif unit == "KiB/s":
             return speed * 8
-        elif self.selected_unit == "B/s":
-            return speed // 125
+        elif unit == "B/s":
+            return speed // 125  # Convert bytes/sec to kbit/s
         return speed
 
     def update_status(self):
-        """Periodically update the limiter status."""
+        """Update the limiter status dynamically."""
         interface = self.get_selected_interface()
+        unit_selected = self.unit_combo.get_active_text()
         if interface:
-            status_text = get_tc_limit(interface)
+            status_text = get_tc_limit(interface, unit_selected)
             self.status_label.set_text(status_text)
-        return True  # Continue the timeout.
+        return True  # Keep the timer running
 
     def apply_limit(self, widget):
         interface = self.get_selected_interface()
         speed_kbps = self.get_speed_in_kbps()
         if not interface or speed_kbps is None:
-            print("Invalid input.")
+            print("Invalid input.", file=sys.stderr)
             return
-        print(f"Applying limits: {speed_kbps} kbps on {interface}")
-        upl_cmd = ["sudo", "tc", "qdisc", "add", "dev", interface, "root",
-                   "tbf", "rate", f"{speed_kbps}kbit", "burst", "16kbit", "latency", "50ms"]
+
+        print(f"Applying limits: {speed_kbps} kbit/s on {interface}")
+
+        # Apply egress limit on the selected interface.
+        upl_cmd = [
+            "sudo", "tc", "qdisc", "add", "dev", interface, "root",
+            "tbf", "rate", f"{speed_kbps}kbit", "burst", "16kbit", "latency", "50ms"
+        ]
         run_command(upl_cmd)
-        dnl_cmd = ["sudo", "tc", "qdisc", "add", "dev", interface, "ingress",
-                   "tbf", "rate", f"{speed_kbps}kbit", "burst", "16kbit", "latency", "50ms"]
-        run_command(dnl_cmd)
+
+        # Set up IFB for ingress limiting.
+        run_command(["sudo", "modprobe", "ifb"])
+        run_command(["sudo", "ip", "link", "set", "ifb0", "up"])
+
+        # Add ingress qdisc to the selected interface.
+        run_command(["sudo", "tc", "qdisc", "add", "dev", interface, "ingress"])
+        # Redirect ingress traffic to ifb0.
+        run_command([
+            "sudo", "tc", "filter", "add", "dev", interface, "parent", "ffff:",
+            "protocol", "ip", "u32", "match", "u32", "0", "0",
+            "action", "mirred", "egress", "redirect", "dev", "ifb0"
+        ])
+        # Before applying on ifb0, remove any existing non-default qdisc.
+        run_command(["sudo", "tc", "qdisc", "del", "dev", "ifb0", "root"],
+                    ignore_errors_for=["Cannot delete qdisc with handle of zero"])
+        # Use "replace" to override any default qdisc on ifb0.
+        i_cmd = [
+            "sudo", "tc", "qdisc", "replace", "dev", "ifb0", "root",
+            "tbf", "rate", f"{speed_kbps}kbit", "burst", "16kbit", "latency", "50ms"
+        ]
+        run_command(i_cmd)
+
         self.update_status()
 
     def clear_limit(self, widget):
         interface = self.get_selected_interface()
         if not interface:
-            print("No interface selected. Cannot clear limits.")
+            print("No interface selected. Cannot clear limits.", file=sys.stderr)
             return
-        print(f"Clearing limits on {interface}.")
-        run_command(["sudo", "tc", "qdisc", "del", "dev", interface, "root"])
-        run_command(["sudo", "tc", "qdisc", "del", "dev", interface, "ingress"])
-        self.update_status()
 
+        print(f"Clearing limits on {interface}.")
+        # Remove egress limit.
+        run_command(["sudo", "tc", "qdisc", "del", "dev", interface, "root"])
+        # Remove ingress qdisc from the selected interface.
+        run_command(["sudo", "tc", "qdisc", "del", "dev", interface, "ingress"])
+        # Remove the qdisc from ifb0.
+        run_command(["sudo", "tc", "qdisc", "del", "dev", "ifb0", "root"],
+                    ignore_errors_for=["Cannot delete qdisc with handle of zero"])
+
+        self.update_status()
 
 class TrafficApp(Gtk.Application):
     def __init__(self):
@@ -247,7 +290,6 @@ class TrafficApp(Gtk.Application):
     def do_activate(self):
         window = TrafficLimiter(self)
         window.present()
-
 
 if __name__ == "__main__":
     app = TrafficApp()
