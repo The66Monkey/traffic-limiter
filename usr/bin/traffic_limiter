@@ -23,6 +23,7 @@ import sys
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk, Gio, GLib
 
+
 def run_command(cmd_list, ignore_errors_for=None):
     """
     Wrapper to run a command via subprocess.
@@ -42,12 +43,25 @@ def run_command(cmd_list, ignore_errors_for=None):
         print(f"Exception running {' '.join(cmd_list)}: {e}", file=sys.stderr)
         return None
 
+
+def ensure_ifb_exists():
+    """Ensure the IFB interface exists and is active."""
+    result = subprocess.run(["ip", "link", "show", "ifb0"], capture_output=True, text=True)
+    # Sometimes the error message is in stdout or stderr.
+    if "does not exist" in result.stderr or "does not exist" in result.stdout:
+        print("Creating ifb0 interface...")
+        subprocess.run(["sudo", "ip", "link", "add", "ifb0", "type", "ifb"])
+        subprocess.run(["sudo", "ip", "link", "set", "ifb0", "up"])
+    else:
+        print("ifb0 already exists.")
+
+
 def get_tc_limit(interface, unit="MiB/s"):
     """
     Fetch active upload/download limits on the given interface.
-    Returns a string showing the rate in kbit and the selected unit.
+    Returns a string showing the rate in kbit and in the selected unit.
     """
-    # Get upload (egress) limit
+    # Get upload (egress) limit on the selected interface.
     result = subprocess.run(["sudo", "tc", "qdisc", "show", "dev", interface],
                             capture_output=True, text=True)
     upload_limit = None
@@ -55,13 +69,14 @@ def get_tc_limit(interface, unit="MiB/s"):
         if "tbf" in line and "rate" in line:
             parts = line.split()
             rate_index = parts.index("rate") + 1
+            # Normalize possible formats (e.g., "81920K" or "81920kbit")
             speed_str = parts[rate_index].lower().rstrip("kbit").rstrip("k")
             try:
                 upload_limit = int(speed_str)
             except ValueError:
                 pass
 
-    # Get download (ingress) limit
+    # Get download (ingress) limit on IFB device.
     result_ifb = subprocess.run(["sudo", "tc", "qdisc", "show", "dev", "ifb0"],
                                 capture_output=True, text=True)
     download_limit = None
@@ -101,6 +116,9 @@ class TrafficLimiter(Gtk.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="TC Bandwidth Limiter")
         self.set_default_size(600, 450)
+
+        # Ensure ifb0 exists at startup
+        ensure_ifb_exists()
 
         # Main vertical box to hold sections.
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -231,16 +249,19 @@ class TrafficLimiter(Gtk.ApplicationWindow):
             print("Invalid input.", file=sys.stderr)
             return
 
+        # Before applying limits, ensure ifb0 exists.
+        ensure_ifb_exists()
+
         print(f"Applying limits: {speed_kbps} kbit/s on {interface}")
 
-        # Apply egress limit on the selected interface.
+        # Apply upload limit (egress) on the selected interface.
         upl_cmd = [
             "sudo", "tc", "qdisc", "add", "dev", interface, "root",
             "tbf", "rate", f"{speed_kbps}kbit", "burst", "16kbit", "latency", "50ms"
         ]
         run_command(upl_cmd)
 
-        # Set up IFB for ingress limiting.
+        # Set up IFB for download limiting.
         run_command(["sudo", "modprobe", "ifb"])
         run_command(["sudo", "ip", "link", "set", "ifb0", "up"])
 
@@ -255,7 +276,7 @@ class TrafficLimiter(Gtk.ApplicationWindow):
         # Before applying on ifb0, remove any existing non-default qdisc.
         run_command(["sudo", "tc", "qdisc", "del", "dev", "ifb0", "root"],
                     ignore_errors_for=["Cannot delete qdisc with handle of zero"])
-        # Use "replace" to override any default qdisc on ifb0.
+        # Use "replace" to override any default qdisc on ifb0 for download limiting.
         i_cmd = [
             "sudo", "tc", "qdisc", "replace", "dev", "ifb0", "root",
             "tbf", "rate", f"{speed_kbps}kbit", "burst", "16kbit", "latency", "50ms"
@@ -271,7 +292,7 @@ class TrafficLimiter(Gtk.ApplicationWindow):
             return
 
         print(f"Clearing limits on {interface}.")
-        # Remove egress limit.
+        # Remove upload limit.
         run_command(["sudo", "tc", "qdisc", "del", "dev", interface, "root"])
         # Remove ingress qdisc from the selected interface.
         run_command(["sudo", "tc", "qdisc", "del", "dev", interface, "ingress"])
@@ -281,6 +302,7 @@ class TrafficLimiter(Gtk.ApplicationWindow):
 
         self.update_status()
 
+
 class TrafficApp(Gtk.Application):
     def __init__(self):
         super().__init__(application_id="com.example.TrafficLimiter",
@@ -289,6 +311,7 @@ class TrafficApp(Gtk.Application):
     def do_activate(self):
         window = TrafficLimiter(self)
         window.present()
+
 
 if __name__ == "__main__":
     app = TrafficApp()
