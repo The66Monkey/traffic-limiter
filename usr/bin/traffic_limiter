@@ -44,36 +44,34 @@ def run_command(cmd_list, ignore_errors_for=None):
 
 def get_tc_limit(interface, unit="MiB/s"):
     """
-    Fetch the active limit on the egress (on the selected interface)
-    and ingress (via ifb0) and return a string showing the rate
-    in kbit and in the selected unit.
+    Fetch active upload/download limits on the given interface.
+    Returns a string showing the rate in kbit and the selected unit.
     """
-    # Get egress limit on the selected interface.
+    # Get upload (egress) limit
     result = subprocess.run(["sudo", "tc", "qdisc", "show", "dev", interface],
                             capture_output=True, text=True)
-    egress_limit = None
+    upload_limit = None
     for line in result.stdout.strip().split("\n"):
         if "tbf" in line and "rate" in line:
             parts = line.split()
             rate_index = parts.index("rate") + 1
-            # Normalize possible formats (e.g., "81920K" or "81920kbit")
             speed_str = parts[rate_index].lower().rstrip("kbit").rstrip("k")
             try:
-                egress_limit = int(speed_str)
+                upload_limit = int(speed_str)
             except ValueError:
                 pass
 
-    # Get ingress limit on IFB device.
+    # Get download (ingress) limit
     result_ifb = subprocess.run(["sudo", "tc", "qdisc", "show", "dev", "ifb0"],
                                 capture_output=True, text=True)
-    ingress_limit = None
+    download_limit = None
     for line in result_ifb.stdout.strip().split("\n"):
         if "tbf" in line and "rate" in line:
             parts = line.split()
             rate_index = parts.index("rate") + 1
             speed_str = parts[rate_index].lower().rstrip("kbit").rstrip("k")
             try:
-                ingress_limit = int(speed_str)
+                download_limit = int(speed_str)
             except ValueError:
                 pass
 
@@ -87,16 +85,17 @@ def get_tc_limit(interface, unit="MiB/s"):
         return speed_kbit
 
     # Build the status string appropriately.
-    if egress_limit is not None and ingress_limit is not None:
-        egress_conv = convert(egress_limit, unit)
-        ingress_conv = convert(ingress_limit, unit)
-        return (f"Egress: {egress_limit} kbit ({egress_conv:.2f} {unit}) | "
-                f"Ingress: {ingress_limit} kbit ({ingress_conv:.2f} {unit})")
-    elif egress_limit is not None:
-        egress_conv = convert(egress_limit, unit)
-        return f"Egress: {egress_limit} kbit ({egress_conv:.2f} {unit}) | Ingress: Not Applied"
+    if upload_limit is not None and download_limit is not None:
+        upload_conv = convert(upload_limit, unit)
+        download_conv = convert(download_limit, unit)
+        return (f"Upload: {upload_limit} kbit ({upload_conv:.2f} {unit}) | "
+                f"Download: {download_limit} kbit ({download_conv:.2f} {unit})")
+    elif upload_limit is not None:
+        upload_conv = convert(upload_limit, unit)
+        return f"Upload: {upload_limit} kbit ({upload_conv:.2f} {unit}) | Download: Not Applied"
     else:
         return "No Limit Applied"
+
 
 class TrafficLimiter(Gtk.ApplicationWindow):
     def __init__(self, app):
